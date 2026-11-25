@@ -1,5 +1,5 @@
 module mod_state
-  use iso_fortran_env, only: int32, real64
+  use iso_fortran_env, only: int32, real64, int8
   use omp_lib, only: omp_get_max_threads, omp_get_num_procs, omp_get_wtime
   use mpi
 
@@ -13,6 +13,8 @@ module mod_state
 
   use mod_fields,         only: Fields
   use mod_poisson_decomp, only: PoissonDecomp
+  use mod_zslab,          only: zslab_init, zs_nlo, zs_nhi, zs_cz_lo, zs_cz_hi
+  use mod_particleMigration, only: migrate_particles
   use mod_charge_weights, only: build_kq
   use mod_debug_checks,   only: checkpoint_poisson_decomp, checkpoint_kq
   use mod_density,        only: reduce_species_density, sync_species_density, clear_np_planes
@@ -62,15 +64,17 @@ module mod_state
     type(SimParams)      :: params
     type(ParticleSet), allocatable :: part(:,:)
 
+    ! Per-thread density, ONLY over this MPI rank's deposit window of
+    ! z-planes zs_nlo:zs_nhi (global plane numbers, mod_zslab):
+    ! np_thread(0:nx+2, 0:ny+2, zs_nlo:zs_nhi, ntype, nproc).
     real(real64), allocatable :: np_thread(:,:,:,:,:)
 
-    ! Per-(ptype,iproc) z-extent of np_thread that may be nonzero: planes
-    ! np_zlo..np_zhi, plus the end planes 0:2 and n3:n3+2 if np_zend /= 0
-    ! (see np_plane_live in mod_density). Every plane outside it is
-    ! exactly zero. Since each iproc owns a z-slab of particles
+    ! np_live(iz,ptype,iproc) /= 0 where np_thread(:,:,iz,ptype,iproc) may
+    ! be nonzero (set by the deposit); every other plane is exactly zero.
+    ! Since each iproc mostly owns a thin z-slab of particles
     ! (redistribute_species_by_cell), this lets the per-step clear and
-    ! the thread reduction touch only that slab instead of the whole grid.
-    integer(int32), allocatable :: np_zlo(:,:), np_zhi(:,:), np_zend(:,:)
+    ! the thread reduction touch only the planes a thread really used.
+    integer(int8), allocatable :: np_live(:,:,:)
 
     ! .false. while fld%np holds only this rank's density (the per-step
     ! deposit leaves it rank-local and MPI-sums only rho); sync_np() makes
@@ -313,20 +317,18 @@ contains
            nint(real(self%cfg%nsav, real64) / real(self%params%ns_RF, real64), int32))
     end if
 
+    ! Slab-local (mod_zslab): only this rank's deposit window of z-planes.
     allocate(self%np_thread(0:self%dom%n(1)+2, &
                             0:self%dom%n(2)+2, &
-                            0:self%dom%n(3)+2, &
+                            zs_nlo:zs_nhi, &
                             self%ntype, self%nproc))
     self%np_thread = 0.0_real64
 
-    ! Start as "whole grid may be nonzero": the initial load and restart
-    ! deposits write np_thread without tracking extents; the first
-    ! per-step deposit clears everything and narrows these.
-    allocate(self%np_zlo(self%ntype, self%nproc), self%np_zhi(self%ntype, self%nproc), &
-             self%np_zend(self%ntype, self%nproc))
-    self%np_zlo  = 0_int32
-    self%np_zhi  = int(self%dom%n(3), int32) + 2_int32
-    self%np_zend = 1_int32
+    ! Start as "whole window may be nonzero": the initial load deposit
+    ! writes np_thread without tracking planes; the first per-step
+    ! deposit clears everything and narrows these.
+    allocate(self%np_live(zs_nlo:zs_nhi, self%ntype, self%nproc))
+    self%np_live = 1_int8
 
     call self%init_particles()
 
@@ -450,6 +452,12 @@ contains
     call self%pdec%init(int(self%dom%n(1),int32), int(self%dom%n(2),int32), int(self%dom%n(3),int32), self%comm)
     call self%pdec%scatter_from_global(self%fld%phi, self%dom%bcnd)
 
+    ! Particle domain decomposition: same z-slabs as the Poisson solver.
+    ! Positions wrap in z whenever flag_pbc == 1 (mod_particleBC), which
+    ! closes the rank chain into a ring for particle migration.
+    call zslab_init(self%comm, int(self%dom%n, int32), self%dom%h, &
+                    self%pdec%k0, self%pdec%m, self%dom%flag_pbc == 1)
+
     if (DEBUG_INIT_CHECKS) then
       call checkpoint_poisson_decomp(self%mpi_rank, self%comm, &
                                      int(self%dom%n(3),int32), self%pdec%k0, self%pdec%m, &
@@ -470,6 +478,11 @@ contains
       call MPI_Allreduce(lmax, gmax, 1, MPI_DOUBLE_PRECISION, MPI_MAX, self%comm, ierr)
 
       deallocate(phi_rt)
+    end if
+
+    if (self%mpi_rank == 0 .and. self%mpi_size > 1) then
+      write(*,'(a,i0,a,i0,a)') 'Particle domain decomposition: ', self%mpi_size, &
+          ' z-slabs of ', self%pdec%m, ' cell planes (same as the Poisson solver)'
     end if
 
     if (self%mpi_rank == 0) then
@@ -508,18 +521,35 @@ contains
             cfg       = self%cfg, &
             mpi_rank  = self%mpi_rank, &
             mpi_size  = self%mpi_size, &
-            n         = int(self%dom%n, int32), &
-            h         = self%dom%h, &
-            kq        = self%fld%kq, &
-            Nm        = self%params%Nm, &
             ntype     = ntype_trk, &
             nproc     = self%nproc, &
             tag_neg   = int(self%chem%tag_neg, int32), &
             iseed     = self%params%iseed, &
             part      = self%part, &
-            np_thread = self%np_thread, &
             time_out  = self%time, &
             E0_RF_out = E0_RF_restart )
+
+      ! Backup files hold whatever particles the writing rank had (any
+      ! rank count, and files written before the z-slab decomposition hold
+      ! particles from the whole domain): send each one to its owner rank,
+      ! then deposit the density (legacy: restart_OMP).
+      call migrate_particles(self%part, global_mode=.true.)
+      self%np_thread = 0.0_real64
+      !$omp parallel do collapse(2) private(ptype,iproc) schedule(static)
+      do ptype = 1_int32, self%ntype
+        do iproc = 1_int32, self%nproc
+          if (.not. allocated(self%part(ptype,iproc)%pv)) cycle
+          if (self%part(ptype,iproc)%n <= 0_int32) cycle
+          call deposit_particle_set_to_np_thread( &
+            part       = self%part(ptype,iproc), &
+            n          = int(self%dom%n, int32), &
+            h          = self%dom%h, &
+            kq         = self%fld%kq, &
+            Nm_species = self%params%Nm(ptype), &
+            np_local   = self%np_thread(:,:,:,ptype,iproc) )
+        end do
+      end do
+      !$omp end parallel do
       ! Applied after the call returns, not passed as an alias of
       ! self%cfg%E0_RF directly - cfg (intent in, whole struct) and
       ! E0_RF_out (intent out) would otherwise be overlapping actual
@@ -543,6 +573,7 @@ contains
             part      = self%part, &
             np_thread = self%np_thread )
     end if
+    self%np_live = 1_int8
     call reduce_species_density( &
          n         = int(self%dom%n, int32), &
          bcnd      = self%dom%bcnd, &
@@ -659,12 +690,31 @@ contains
     integer(int32) :: igrid
     real(real64)   :: Ca
     real(real64)   :: qsum_xz, qsum_yz_1, qsum_yz_2
+    real(real64), allocatable :: q_xz(:,:,:), q_yz(:,:,:,:)
+    integer :: ierr
 
     if (self%dom%flag_die /= 1) return
     if (.not. allocated(self%sum_q_xz)) return
     if (.not. allocated(self%sum_q_yz)) return
 
     Ca = self%params%Ca_cell
+
+    ! Charge collected on the dielectrics this step: thread sums, then
+    ! MPI-summed - with the z-slab decomposition a wall node on a slab
+    ! face receives charge from particles of both neighbouring ranks, and
+    ! every rank's Poisson slab reads its own copy of phi there.
+    allocate(q_xz(0:self%dom%n(1)+2, 0:self%dom%n(3)+2, self%ntype))
+    allocate(q_yz(2, 0:self%dom%n(2)+2, 0:self%dom%n(3)+2, self%ntype))
+    q_xz = 0.0_real64
+    q_yz = 0.0_real64
+    do iproc = 1, self%nproc
+      q_xz = q_xz + self%sum_q_xz(:,:,:,iproc)
+      q_yz = q_yz + self%sum_q_yz(:,:,:,:,iproc)
+    end do
+    if (self%mpi_size > 1) then
+      call MPI_Allreduce(MPI_IN_PLACE, q_xz, size(q_xz), MPI_DOUBLE_PRECISION, MPI_SUM, self%comm, ierr)
+      call MPI_Allreduce(MPI_IN_PLACE, q_yz, size(q_yz), MPI_DOUBLE_PRECISION, MPI_SUM, self%comm, ierr)
+    end if
 
     do iz = 0, self%dom%n(3)+2
       do iy = 0, self%dom%n(2)+2
@@ -676,26 +726,17 @@ contains
           do ptype = 1, self%ntype
 
             if (self%dom%dtype(igrid) == 2) then
-              qsum_xz = 0.0_real64
-              do iproc = 1, self%nproc
-                qsum_xz = qsum_xz + self%sum_q_xz(ix,iz,ptype,iproc)
-              end do
+              qsum_xz = q_xz(ix,iz,ptype)
               self%fld%phi(ix,iy,iz) = self%fld%phi(ix,iy,iz) + qsum_xz / (2.0_real64 * Ca)
             end if
 
             if (self%dom%dtype(igrid) == 3) then
-              qsum_yz_1 = 0.0_real64
-              do iproc = 1, self%nproc
-                qsum_yz_1 = qsum_yz_1 + self%sum_q_yz(1,iy,iz,ptype,iproc)
-              end do
+              qsum_yz_1 = q_yz(1,iy,iz,ptype)
               self%fld%phi(ix,iy,iz) = self%fld%phi(ix,iy,iz) + qsum_yz_1 / Ca
             end if
 
             if (self%dom%dtype(igrid) == 4) then
-              qsum_yz_2 = 0.0_real64
-              do iproc = 1, self%nproc
-                qsum_yz_2 = qsum_yz_2 + self%sum_q_yz(2,iy,iz,ptype,iproc)
-              end do
+              qsum_yz_2 = q_yz(2,iy,iz,ptype)
               self%fld%phi(ix,iy,iz) = self%fld%phi(ix,iy,iz) + qsum_yz_2 / Ca
             end if
 
@@ -1321,18 +1362,28 @@ contains
         tw1 = omp_get_wtime()
         t_move_thread(iproc) = t_move_thread(iproc) + (tw1 - tw0)
       end do
+    end do
+    !$omp end parallel do
+
+    ! Particles that left this rank's z-slab (push, BC wrap, secondary
+    ! electrons emitted at a wall) go to the rank that owns them before
+    ! anything is deposited: the deposit window, the cell lists and the
+    ! collision tables only cover this rank's slab (mod_zslab). Timed into
+    ! t_bc_out (the former, now always-zero, BC slot).
+    tw0 = omp_get_wtime()
+    call migrate_particles(self%part, global_mode=.false.)
+    t_bc_thread(:) = omp_get_wtime() - tw0
+
+    !$omp parallel do private(iproc,ptype,tw0,tw1,heat_loc) schedule(static)
+    do iproc = 1, self%nproc
 
       tw0 = omp_get_wtime()
       if (do_heat_tally) heat_loc = heat_tpl
       do ptype = 1, self%ntype
-        ! Clear only the planes the previous deposit (+ periodic BC) could
-        ! have made nonzero, then mark empty until this deposit reports.
+        ! Clear only the planes the previous deposit touched; this deposit
+        ! flags the ones it writes.
         call clear_np_planes(self%np_thread(:,:,:,ptype,iproc), int(self%dom%n, int32), &
-                             self%np_zlo(ptype,iproc), self%np_zhi(ptype,iproc), &
-                             self%np_zend(ptype,iproc))
-        self%np_zlo(ptype,iproc)  = huge(1_int32)
-        self%np_zhi(ptype,iproc)  = -huge(1_int32)
-        self%np_zend(ptype,iproc) = 0_int32
+                             self%np_live(:,ptype,iproc))
 
         if (.not. allocated(self%part(ptype,iproc)%pv)) cycle
         if (self%part(ptype,iproc)%n <= 0_int32) cycle
@@ -1346,8 +1397,7 @@ contains
             Nm_species = self%params%Nm(ptype), &
             np_local   = self%np_thread(:,:,:,ptype,iproc), &
             heat       = heat_loc, &
-            iz_lo      = self%np_zlo(ptype,iproc), &
-            iz_hi      = self%np_zhi(ptype,iproc) )
+            live       = self%np_live(:,ptype,iproc) )
         else
           call deposit_particle_set_to_np_thread( &
             part       = self%part(ptype,iproc), &
@@ -1356,16 +1406,7 @@ contains
             kq         = self%fld%kq, &
             Nm_species = self%params%Nm(ptype), &
             np_local   = self%np_thread(:,:,:,ptype,iproc), &
-            iz_lo      = self%np_zlo(ptype,iproc), &
-            iz_hi      = self%np_zhi(ptype,iproc) )
-        end if
-
-        ! apply_periodic_density_bc's z-stitching copies between planes
-        ! {1,2,n3,n3+1} and {0,1,n3+1,n3+2}: if this deposit reached
-        ! within two planes of either end, both end blocks may turn nonzero.
-        if (self%np_zlo(ptype,iproc) <= 2_int32 .or. &
-            self%np_zhi(ptype,iproc) >= int(self%dom%n(3), int32)) then
-          self%np_zend(ptype,iproc) = 1_int32
+            live       = self%np_live(:,ptype,iproc) )
         end if
       end do
       ! One write per thread (no per-particle updates of shared arrays).
@@ -1860,7 +1901,7 @@ contains
     call self%finalize_particles_only()
 
     if (allocated(self%np_thread))    deallocate(self%np_thread)
-    if (allocated(self%np_zlo))       deallocate(self%np_zlo, self%np_zhi, self%np_zend)
+    if (allocated(self%np_live))      deallocate(self%np_live)
     if (allocated(self%sum_q_xz))     deallocate(self%sum_q_xz)
     if (allocated(self%sum_q_yz))     deallocate(self%sum_q_yz)
     if (allocated(self%P_loss))       deallocate(self%P_loss)

@@ -2,6 +2,7 @@ module mod_particle_sorting
   use iso_fortran_env, only: int32, real64, int8
   use mod_particles,   only: ParticleSet
   use omp_lib,         only: omp_get_max_threads
+  use mod_zslab,       only: zs_c_lo, zs_c_hi, zs_cz_lo, zs_cz_hi
   implicit none
   private
 
@@ -104,14 +105,14 @@ contains
     scratch_cap = new_cap
   end subroutine ensure_sort_scratch
 
-  subroutine ensure_sort_cell_scratch(ncells)
-    integer(int32), intent(in) :: ncells
-
-    if (ncells <= cell_scratch_cap) return
-
-    if (allocated(next_slot)) deallocate(next_slot)
-    allocate(next_slot(ncells))
-    cell_scratch_cap = ncells
+  subroutine ensure_sort_cell_scratch()
+    ! next_slot spans this rank's cell range (global ids, mod_zslab).
+    if (allocated(next_slot)) then
+      if (lbound(next_slot,1) == zs_c_lo .and. ubound(next_slot,1) == zs_c_hi) return
+      deallocate(next_slot)
+    end if
+    allocate(next_slot(zs_c_lo:zs_c_hi))
+    cell_scratch_cap = zs_c_hi - zs_c_lo + 1_int32
   end subroutine ensure_sort_cell_scratch
 
   pure integer(int32) function cell_index_from_position(x, y, z, h, n) result(ic)
@@ -129,7 +130,10 @@ contains
     ! Valid cell ids are therefore:
     !   1 ... n(1)*n(2)*n(3)
     !
-    ! Particle positions are clamped into the physical cell range.
+    ! Particle positions are clamped into the physical cell range, and z
+    ! into this MPI rank's slab (mod_zslab) - every particle a rank holds
+    ! lies in its slab once migrated, so the z clamp only guards
+    ! roundoff at the slab faces.
     !=============================================================
     real(real64),   intent(in) :: x, y, z
     real(real64),   intent(in) :: h(3)
@@ -143,7 +147,7 @@ contains
 
     ix = max(1_int32, min(n(1), ix))
     iy = max(1_int32, min(n(2), iy))
-    iz = max(1_int32, min(n(3), iz))
+    iz = max(zs_cz_lo, min(zs_cz_hi, iz))
 
     ic = (ix - 1_int32) + n(1) * ((iy - 1_int32) + n(2) * (iz - 1_int32)) + 1_int32
   end function cell_index_from_position
@@ -162,11 +166,9 @@ contains
     integer(int32),     intent(in)    :: n(3)
     real(real64),       intent(in)    :: h(3)
 
-    integer(int32) :: i, ic, ncells, lo, hi
+    integer(int32) :: i, ic, lo, hi
 
-    ncells = n(1) * n(2) * n(3)
-
-    call part%ensure_cell_storage(ncells)
+    call part%ensure_cell_storage()
 
     ! Only cells cell_lo..cell_hi can be nonzero (see ParticleSet).
     call clear_cell_range(part)
@@ -223,23 +225,22 @@ contains
     integer(int32),     intent(in)    :: n(3)
     real(real64),       intent(in)    :: h(3)
 
-    integer(int32) :: np, ncells
+    integer(int32) :: np
     integer(int32) :: i, ic, pos
 
     if (.not. allocated(part%pv)) return
 
     np     = part%n
-    ncells = n(1) * n(2) * n(3)
 
-    call part%ensure_cell_storage(ncells)
+    call part%ensure_cell_storage()
     call compute_particle_cell_ids(part, n, h)
 
     if (np <= 1_int32) return
 
     call ensure_sort_scratch(np)
-    call ensure_sort_cell_scratch(ncells)
+    call ensure_sort_cell_scratch()
 
-    next_slot(1:ncells) = part%cell_start(1:ncells)
+    next_slot(zs_c_lo:zs_c_hi) = part%cell_start(zs_c_lo:zs_c_hi)
 
     ! part%sp is deliberately NOT staged/reordered here: since this
     ! ParticleSet holds exactly one species (indexed by ptype at the
@@ -319,7 +320,8 @@ contains
     integer(int32) :: nblk, b, b0, b1, i0, i1
 
     nproc  = size(parts)
-    ncells = n(1) * n(2) * n(3)
+    ! This rank's cells only: global ids zs_c_lo..zs_c_hi (mod_zslab).
+    ncells = zs_c_hi - zs_c_lo + 1_int32
 
     ntot = 0_int32
     do p = 1, nproc
@@ -335,9 +337,11 @@ contains
       allocate(gstage(gscratch_cap), gcell(gscratch_cap), &
                gdead(gscratch_cap), gcex(gscratch_cap))
     end if
-    if (ncells > gcell_cap) then
-      if (allocated(gstart)) deallocate(gstart)
-      allocate(gstart(ncells))
+    if (allocated(gstart)) then
+      if (lbound(gstart,1) /= zs_c_lo .or. ubound(gstart,1) /= zs_c_hi) deallocate(gstart)
+    end if
+    if (.not. allocated(gstart)) then
+      allocate(gstart(zs_c_lo:zs_c_hi))
       gcell_cap = ncells
     end if
 
@@ -348,7 +352,7 @@ contains
       if (allocated(parts(p)%pv)) then
         call compute_particle_cell_ids(parts(p), n, h)
       else
-        call parts(p)%ensure_cell_storage(ncells)
+        call parts(p)%ensure_cell_storage()
         parts(p)%cell_count = 0_int32
       end if
     end do
@@ -369,8 +373,8 @@ contains
     nblk = max(1_int32, min(ncells, 8_int32*int(omp_get_max_threads(), int32)))
     !$omp parallel do private(b,b0,b1,p,i0,i1) schedule(static)
     do b = 1, nblk
-      b0 = int((int(ncells,8)*(b-1))/nblk, int32) + 1_int32
-      b1 = int((int(ncells,8)*b)/nblk, int32)
+      b0 = int((int(ncells,8)*(b-1))/nblk, int32) + zs_c_lo
+      b1 = int((int(ncells,8)*b)/nblk, int32) + zs_c_lo - 1_int32
       gstart(b0:b1) = 0_int32
       do p = 1, nproc
         i0 = max(b0, plo(p)); i1 = min(b1, phi(p))
@@ -387,8 +391,8 @@ contains
     !    within a cell keeps the result independent of thread scheduling.
     !$omp parallel do private(b,b0,b1,p,i0,i1) schedule(static)
     do b = 1, nblk
-      b0 = int((int(ncells,8)*(b-1))/nblk, int32) + 1_int32
-      b1 = int((int(ncells,8)*b)/nblk, int32)
+      b0 = int((int(ncells,8)*(b-1))/nblk, int32) + zs_c_lo
+      b1 = int((int(ncells,8)*b)/nblk, int32) + zs_c_lo - 1_int32
       do p = 1, nproc
         i0 = max(b0, plo(p)); i1 = min(b1, phi(p))
         if (i0 <= i1) then
@@ -589,23 +593,23 @@ contains
       return
     end if
 
-    ncells = n(1) * n(2) * n(3)
+    ncells = zs_c_hi - zs_c_lo + 1_int32
 
-    if (size(part%cell_count) /= ncells) then
+    if (size(part%cell_count) /= ncells .or. lbound(part%cell_count,1) /= zs_c_lo) then
       ok = .false.
       return
     end if
 
-    if (size(part%cell_start) /= ncells) then
+    if (size(part%cell_start) /= ncells .or. lbound(part%cell_start,1) /= zs_c_lo) then
       ok = .false.
       return
     end if
 
-    allocate(counts_scan(ncells))
+    allocate(counts_scan(zs_c_lo:zs_c_hi))
     counts_scan = 0_int32
 
     do i = 1, part%n
-      if (part%cell_id(i) < 1_int32 .or. part%cell_id(i) > ncells) then
+      if (part%cell_id(i) < zs_c_lo .or. part%cell_id(i) > zs_c_hi) then
         ok = .false.
         deallocate(counts_scan)
         return
@@ -613,7 +617,7 @@ contains
       counts_scan(part%cell_id(i)) = counts_scan(part%cell_id(i)) + 1_int32
     end do
 
-    do icell = 1, ncells
+    do icell = zs_c_lo, zs_c_hi
       if (part%cell_count(icell) /= counts_scan(icell)) then
         ok = .false.
         deallocate(counts_scan)
@@ -621,7 +625,7 @@ contains
       end if
     end do
 
-    do icell = 1, ncells
+    do icell = zs_c_lo, zs_c_hi
       if (part%cell_count(icell) > 0_int32) then
         i0 = part%cell_start(icell)
         i1 = i0 + part%cell_count(icell) - 1_int32
@@ -667,7 +671,7 @@ contains
     if (.not. allocated(part%cell_count)) return
     if (.not. allocated(part%cell_start)) return
 
-    if (icell < 1_int32 .or. icell > size(part%cell_count)) return
+    if (icell < lbound(part%cell_count,1) .or. icell > ubound(part%cell_count,1)) return
 
     count = part%cell_count(icell)
     if (count <= 0_int32) return

@@ -14,6 +14,7 @@ module mod_BMCCcollisions
 
   use iso_fortran_env,  only: int32, int8, real64
   use mod_particles,    only: ParticleSet
+  use mod_zslab,        only: zs_cz_lo, zs_cz_hi
   use mod_RNG,          only: ran2
   use mod_collisionDiagnostics, only: count_rxn
 
@@ -512,7 +513,7 @@ contains
 
     ix = max(1_int32, min(n(1), ix))
     iy = max(1_int32, min(n(2), iy))
-    iz = max(1_int32, min(n(3), iz))
+    iz = max(zs_cz_lo, min(zs_cz_hi, iz))
 
     icell = (ix-1_int32) + n(1)*((iy-1_int32) + n(2)*(iz-1_int32)) + 1_int32
 
@@ -522,13 +523,13 @@ contains
     if (ix > 1_int32) neigh(3) = icell - 1_int32
     if (iy < n(2)) neigh(4) = icell + n(1)
     if (iy > 1_int32) neigh(5) = icell - n(1)
-    if (iz < n(3)) neigh(6) = icell + n(1)*n(2)
-    if (iz > 1_int32) neigh(7) = icell - n(1)*n(2)
+    if (iz < zs_cz_hi) neigh(6) = icell + n(1)*n(2)
+    if (iz > zs_cz_lo) neigh(7) = icell - n(1)*n(2)
 
     do idir = 1_int32, 7_int32
       ic_try = neigh(idir)
       if (ic_try <= 0_int32) cycle
-      if (ic_try > size(p%cell_count)) cycle
+      if (ic_try < lbound(p%cell_count,1) .or. ic_try > ubound(p%cell_count,1)) cycle
 
 
 

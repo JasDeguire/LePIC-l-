@@ -35,6 +35,8 @@ module mod_injection
   use mod_RNG,          only: ran2
   use mod_constants,    only: pi, qe
   use omp_lib
+  use mpi
+  use mod_zslab,        only: zs_comm
   implicit none
   private
 
@@ -58,10 +60,11 @@ contains
       iseed, N_inj, &
       sour_xy, sour_xz, sour_yz, &
       iz_pl, ix_pl, &
-      P_loss, mom_loss )
+      P_loss, mom_loss, mpi_size )
 
     type(ParticleSet), intent(inout) :: part(ntype, nproc)
     integer(int32),    intent(in)    :: iproc
+    integer,           intent(in)    :: mpi_size
     type(Config),      intent(in)    :: cfg
     integer(int32),    intent(in)    :: n(3)
     real(real64),      intent(in)    :: h(3)
@@ -97,9 +100,13 @@ contains
     real(real64)   :: xm, ym, zm, dx, dy, dz, Rb, vb, vmax, fmax, dN_inj
     real(real64)   :: z_tmp, dt_tmp, phip
     real(real64)   :: px, py, pz, ki(8)
-    integer(int32) :: mpi_size_1  ! nproc_mpi, hardcoded 1 for current single-MPI runs
+    integer(int32) :: mpi_size_1  ! number of MPI ranks sharing the injected current
 
-    mpi_size_1 = 1_int32  ! adjust if MPI is enabled
+    ! Every rank injects its share of I_inj, anywhere in the injection
+    ! region; the caller then migrates the new particles to the ranks
+    ! that own their z-slab. (This was hardcoded to 1, which made every
+    ! rank inject the full current on multi-rank runs.)
+    mpi_size_1 = int(max(1, mpi_size), int32)
 
     vz_sav = 0.0_real64
     xm = (cfg%xl_pow + cfg%xr_pow) / 2.0_real64
@@ -400,10 +407,29 @@ contains
     end do
     !$omp end parallel do
 
-    ! Source term diagnostic output — matches legacy's MOD(istep,nsav)==1 write
-    if (mpi_rank == 0 .and. mod(istep, nsav) == 1_int32) then
-      call write_sour_fx_yz(n(2), n(3), ntype, nproc, sour_fx_yz, ptype, &
-                             istep, dt, h, Nm(ptype))
+    ! Source term diagnostic output — matches legacy's MOD(istep,nsav)==1 write.
+    ! Each rank only tallies the particles it injected, so the thread sums
+    ! are MPI-summed onto rank 0 (collective: every rank gets here).
+    if (mod(istep, nsav) == 1_int32) then
+      block
+        integer(int64), allocatable :: sour_sum(:,:)
+        integer(int64) :: dummy(1)
+        integer :: ierr
+        allocate(sour_sum(0:n(2)+2, 0:n(3)+2))
+        sour_sum = sum(int(sour_fx_yz(:,:,ptype,:), int64), dim=3)
+        if (mpi_size > 1) then
+          if (mpi_rank == 0) then
+            call MPI_Reduce(MPI_IN_PLACE, sour_sum, size(sour_sum), MPI_INTEGER8, MPI_SUM, &
+                            0, zs_comm, ierr)
+          else
+            call MPI_Reduce(sour_sum, dummy, size(sour_sum), MPI_INTEGER8, MPI_SUM, &
+                            0, zs_comm, ierr)
+          end if
+        end if
+        if (mpi_rank == 0) call write_sour_fx_yz(n(2), n(3), sour_sum, ptype, &
+                                                 istep, dt, h, Nm(ptype))
+        deallocate(sour_sum)
+      end block
     end if
 
     if (istep == 1_int32 .and. mpi_rank == 0) then
@@ -514,18 +540,15 @@ contains
   ! Write sour_fx_yz diagnostic — port of the MOD(istep,nsav)==1 block
   ! in part_flux_injection()
   !=========================================================================
-  subroutine write_sour_fx_yz(ny, nz, ntype, nproc, sour_fx_yz, ptype, &
-                               istep, dt, h, Nm_p)
-    integer(int32), intent(in) :: ny, nz, ntype, nproc, ptype, istep
-    integer(int32), intent(in) :: sour_fx_yz(0:ny+2, 0:nz+2, ntype, nproc)
+  subroutine write_sour_fx_yz(ny, nz, sour_sum, ptype, istep, dt, h, Nm_p)
+    ! sour_sum: flux-injection counts summed over threads and MPI ranks.
+    integer(int32), intent(in) :: ny, nz, ptype, istep
+    integer(int64), intent(in) :: sour_sum(0:ny+2, 0:nz+2)
     real(real64),   intent(in) :: dt, h(3), Nm_p
 
     integer(int32) :: iy, iz
-    integer(int32) :: sour_sum(0:ny+2, 0:nz+2)
     real(real64)   :: k_norm
     character(1)   :: pnum
-
-    sour_sum = sum(sour_fx_yz(:,:,ptype,:), dim=3)
 
     k_norm = Nm_p / (h(1)*h(2)*h(3))
     write(pnum,'(i1)') ptype

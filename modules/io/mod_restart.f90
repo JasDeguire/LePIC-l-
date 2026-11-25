@@ -56,12 +56,11 @@ module mod_restart
   ! depth) is deliberately NOT persisted, here or in legacy: it's fully
   ! re-derived from the local electron density on the first
   ! update_rf_convergence call after restart, and that density is already
-  ! reconstructed by this module's existing post-restart deposit below.
+  ! reconstructed by the post-restart deposit in mod_state%init_particles.
   !===========================================================================
   use iso_fortran_env,       only: int8, int32, real64
   use mod_particles,         only: ParticleSet
   use mod_config,            only: Config
-  use mod_chargeDeposition,  only: deposit_particle_set_to_np_thread
   use mod_RNG,                only: ran2
   implicit none
   private
@@ -157,20 +156,20 @@ contains
   ! cfg%flag_restart > 0, in place of load_particles_modular.
   !=========================================================================
   subroutine restart_particles_modular( &
-      cfg, mpi_rank, mpi_size, n, h, kq, Nm, ntype, nproc, tag_neg, &
-      iseed, part, np_thread, time_out, E0_RF_out)
+      cfg, mpi_rank, mpi_size, ntype, nproc, tag_neg, &
+      iseed, part, time_out, E0_RF_out)
+    ! Reads this rank's backup file(s) into part. The particles read are
+    ! NOT necessarily in this rank's z-slab (the writer may have had a
+    ! different rank count, or predate the z-slab decomposition): the
+    ! caller (mod_state%init_particles) migrates them to their owner
+    ! ranks and only then deposits the density.
 
     type(Config),      intent(in)    :: cfg
     integer,           intent(in)    :: mpi_rank, mpi_size
-    integer(int32),    intent(in)    :: n(3)
-    real(real64),      intent(in)    :: h(3)
-    real(real64),      intent(in)    :: kq(0:n(1)+2,0:n(2)+2,0:n(3)+2)
-    real(real64),      intent(in)    :: Nm(:)
     integer(int32),    intent(in)    :: ntype, nproc
     integer(int32),    intent(in)    :: tag_neg
     integer(int32),    intent(inout) :: iseed(:)
     type(ParticleSet), intent(inout) :: part(:,:)
-    real(real64),      intent(inout) :: np_thread(0:n(1)+2,0:n(2)+2,0:n(3)+2,ntype,nproc)
     real(real64),      intent(out)   :: time_out
     real(real64),      intent(out)   :: E0_RF_out
 
@@ -189,25 +188,6 @@ contains
     end if
 
     call apply_np_dup(cfg%np_dup, ntype, nproc, iseed, part)
-
-    ! Density deposit (legacy: restart_OMP), reusing the existing
-    ! production deposition kernel rather than re-deriving the CIC
-    ! weights here.
-    np_thread = 0.0_real64
-    !$omp parallel do collapse(2) private(ptype,iproc) schedule(static)
-    do ptype = 1_int32, ntype
-      do iproc = 1_int32, nproc
-        if (part(ptype, iproc)%n <= 0_int32) cycle
-        call deposit_particle_set_to_np_thread( &
-          part       = part(ptype, iproc), &
-          n          = n, &
-          h          = h, &
-          kq         = kq, &
-          Nm_species = Nm(ptype), &
-          np_local   = np_thread(:,:,:,ptype,iproc) )
-      end do
-    end do
-    !$omp end parallel do
 
   end subroutine restart_particles_modular
 

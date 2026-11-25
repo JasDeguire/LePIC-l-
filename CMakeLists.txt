@@ -151,6 +151,7 @@ add_library(core_deps OBJECT
   ${MODULES_DIR}/core/mod_constants.f90
   ${MODULES_DIR}/core/mod_utils.f90
   ${MODULES_DIR}/core/mod_RNG.f90
+  ${MODULES_DIR}/core/mod_zslab.f90
 )
 target_link_libraries(core_deps PUBLIC build_config)
 target_include_directories(core_deps PUBLIC
@@ -214,6 +215,7 @@ add_library(pic_core_obj OBJECT
 
   ${MODULES_DIR}/particles/mod_chemistryState.f90
   ${MODULES_DIR}/particles/mod_particles.f90
+  ${MODULES_DIR}/particles/mod_particleMigration.f90
 
   ${MODULES_DIR}/collisions/mod_collisionProducts.f90
   ${MODULES_DIR}/collisions/mod_collisionUtilities.f90

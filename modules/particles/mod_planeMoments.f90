@@ -3,6 +3,8 @@ module mod_planeMoments
   use mod_particles,   only: ParticleSet
   use mod_constants,   only: qe
   use mod_simParams,   only: SimParams
+  use mod_zslab,       only: zs_comm, zs_size
+  use mpi
   implicit none
   private
 
@@ -175,6 +177,18 @@ contains
       end do
     end do
     !$omp end parallel do
+
+    ! z-slab decomposition: each rank only holds the particles of its own
+    ! slab, so the raw plane sums are MPI-summed before normalising (every
+    ! rank then holds the moments of the whole plane, as on one rank).
+    if (zs_size > 1) then
+      block
+        integer :: ierr
+        call MPI_Allreduce(MPI_IN_PLACE, t_xy, size(t_xy), MPI_DOUBLE_PRECISION, MPI_SUM, zs_comm, ierr)
+        call MPI_Allreduce(MPI_IN_PLACE, t_xz, size(t_xz), MPI_DOUBLE_PRECISION, MPI_SUM, zs_comm, ierr)
+        call MPI_Allreduce(MPI_IN_PLACE, t_yz, size(t_yz), MPI_DOUBLE_PRECISION, MPI_SUM, zs_comm, ierr)
+      end block
+    end if
 
     ! Normalise. Velocity sums are added into data_*(u1:u3) (as the
     ! serial version accumulated straight into them) and divided by the

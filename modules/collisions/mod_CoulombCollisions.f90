@@ -35,10 +35,12 @@ module mod_CoulombCollisions
   !     thermodynamically consistent temperatures rather than local
   !     per-thread estimates.
   !=========================================================================
-  use iso_fortran_env, only: int8, int32, real64
+  use iso_fortran_env, only: int8, int32, int64, real64
   use mod_particles,   only: ParticleSet
   use mod_constants,   only: qe, eps0, pi
   use mod_RNG,         only: ran2
+  use mod_zslab,       only: zs_comm, zs_size
+  use mpi
   implicit none
   private
 
@@ -72,7 +74,7 @@ contains
     integer(int32),    intent(inout) :: iseed(nproc)
 
     integer(int32) :: ptype, ttype, iproc
-    integer(int32) :: N_global(NTYPE_MAX)
+    integer(int64) :: N_global(NTYPE_MAX)
     real(real64)   :: Ti(NTYPE_MAX)             ! kinetic temperature [eV]
     real(real64)   :: Aab(NTYPE_MAX, NTYPE_MAX) ! Nanbu Coulomb parameter [m^3/s^3 units]
     real(real64)   :: n_tot                     ! total number density [m^-3]
@@ -123,13 +125,13 @@ contains
     type(ParticleSet), intent(in)  :: part(ntype, nproc)
     integer(int32),    intent(in)  :: ntype, nproc
     real(real64),      intent(in)  :: mass(ntype)
-    integer(int32),    intent(out) :: N_global(NTYPE_MAX)
+    integer(int64),    intent(out) :: N_global(NTYPE_MAX)
     real(real64),      intent(out) :: Ti(NTYPE_MAX)
 
     real(real64) :: v2sum(NTYPE_MAX)
     integer(int32) :: ptype, iproc, i, nlive
 
-    N_global = 0_int32
+    N_global = 0_int64
     v2sum    = 0.0_real64
 
     do ptype = 1_int32, ntype
@@ -144,13 +146,23 @@ contains
             part(ptype,iproc)%pv(5,i)**2 + &
             part(ptype,iproc)%pv(6,i)**2
         end do
-        N_global(ptype) = N_global(ptype) + nlive
+        N_global(ptype) = N_global(ptype) + int(nlive, int64)
       end do
     end do
 
+    ! z-slab decomposition: each rank holds only its slab's particles, so
+    ! the counts and <v^2> sums are MPI-summed into true global moments.
+    if (zs_size > 1) then
+      block
+        integer :: ierr
+        call MPI_Allreduce(MPI_IN_PLACE, N_global, ntype, MPI_INTEGER8, MPI_SUM, zs_comm, ierr)
+        call MPI_Allreduce(MPI_IN_PLACE, v2sum, ntype, MPI_DOUBLE_PRECISION, MPI_SUM, zs_comm, ierr)
+      end block
+    end if
+
     ! Ti [eV] = m * <v^2> / (3 * qe)
     do ptype = 1_int32, ntype
-      if (N_global(ptype) > 0_int32) then
+      if (N_global(ptype) > 0_int64) then
         Ti(ptype) = mass(ptype) * (v2sum(ptype) / real(N_global(ptype), real64)) &
                     / (3.0_real64 * qe)
       else
@@ -167,7 +179,7 @@ contains
   ! If all species share the same Nm, this simplifies to n_e * Ntot/Ne.
   !=========================================================================
   real(real64) function compute_n_tot(N_global, Nm, n_e, ntype)
-    integer(int32), intent(in) :: N_global(NTYPE_MAX)
+    integer(int64), intent(in) :: N_global(NTYPE_MAX)
     real(real64),   intent(in) :: Nm(ntype)
     real(real64),   intent(in) :: n_e
     integer(int32), intent(in) :: ntype

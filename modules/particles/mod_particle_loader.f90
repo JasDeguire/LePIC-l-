@@ -5,6 +5,7 @@ module mod_particle_loader
   use mod_particles, only: ParticleSet
   use mod_rng,       only: ran2
   use mod_utils,     only: stop_calculation
+  use mod_zslab,     only: zs_nlo, zs_nhi, zs_cz_lo, zs_cz_hi
   implicit none
   private
   public :: load_particles_modular
@@ -27,12 +28,13 @@ contains
 
     type(ParticleSet), intent(inout) :: part(:,:)
 
-    real(real64), intent(out) :: np_thread(0:n(1)+2,0:n(2)+2,0:n(3)+2,ntype_trk,size(part,2))
+    ! Slab-local deposit window (mod_zslab).
+    real(real64), intent(out) :: np_thread(0:n(1)+2,0:n(2)+2,zs_nlo:zs_nhi,ntype_trk,size(part,2))
 
     integer(int32) :: nproc
     integer(int32) :: np_cell, n_cell, ix_load
     integer(int32) :: jmax, nmax
-    real(real64)   :: x_load, ymax, zmax
+    real(real64)   :: x_load, ymax, zmax, zlo_slab, dz_slab
 
     integer :: iproc, ptype, j, k
     integer :: ix, iy, iz
@@ -71,9 +73,16 @@ contains
     if (ix_load < 1_int32)      ix_load = 1_int32
     if (ix_load > n(1)+1_int32) ix_load = n(1)+1_int32
 
-    ! Legacy-compatible count of loadable cells
+    ! z-slab decomposition: this rank loads only its own cell planes
+    ! zs_cz_lo..zs_cz_hi, with as many particles as its share of the
+    ! loadable cells - the same uniform density as the legacy global
+    ! load split over mpi_size ranks.
+    zlo_slab = real(zs_cz_lo - 1_int32, real64) * h(3)
+    dz_slab  = real(zs_cz_hi - zs_cz_lo + 1_int32, real64) * h(3)
+
+    ! Legacy-compatible count of loadable cells (this rank's slab)
     n_cell = 0_int32
-    do iz = 1, n(3)
+    do iz = zs_cz_lo, zs_cz_hi
       do iy = 1, n(2)
         do ix = 1, ix_load - 1
           if ( bcnd(ix,iy,iz)       == -1 .or. &
@@ -90,7 +99,7 @@ contains
       end do
     end do
 
-    jmax = nint(real(np_cell*n_cell, real64) / real(max(1, mpi_size*nproc), real64))
+    jmax = nint(real(np_cell*n_cell, real64) / real(max(1, nproc), real64))
     nmax = int(1.3_real64 * real(max(1,jmax),real64), int32) + 32_int32
 
     allocate(vxp(6, nmax, ntype_trk, nproc))
@@ -125,11 +134,12 @@ contains
       rnd(1) = ran2(iseed_omp)
       y = rnd(1) * ymax
       rnd(1) = ran2(iseed_omp)
-      z = rnd(1) * zmax
+      z = zlo_slab + rnd(1) * dz_slab
 
       ix = int(x / h(1)) + 1
       iy = int(y / h(2)) + 1
       iz = int(z / h(3)) + 1
+      if (iz < zs_cz_lo .or. iz > zs_cz_hi) goto 70   ! roundoff at the slab face
 
       if ( bcnd(ix,iy,iz)       >= 1 .and. &
            bcnd(ix+1,iy,iz)     >= 1 .and. &

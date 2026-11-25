@@ -1,5 +1,6 @@
 module mod_particleMover
   use iso_fortran_env, only: int32, real64, int8
+  use mod_zslab,       only: zs_cz_lo, zs_cz_hi, zs_nz, zs_hz
   use mod_particles,   only: ParticleSet
   use mod_constants,   only: qe, pi
   use mod_rng,         only: ran2, load_gauss
@@ -295,6 +296,9 @@ contains
     integer(int32) :: i, i_shift, i_see, ip_sec, n_sec
     integer(int32) :: ix, iy, iz
     integer(int32) :: flag_lost, np_lost
+    ! z-slab migration candidates (see ParticleSet%mig_idx)
+    integer(int32) :: iz_mig, mig_lo, mig_hi, mig_nz
+    real(real64)   :: mig_hz
     integer(int32) :: igrid, d_ind
 
     real(real64) :: qmdt
@@ -352,6 +356,8 @@ contains
     has_flag_cex  = allocated(part%flag_cex)
 
     np_lost = 0_int32
+    mig_lo = zs_cz_lo;  mig_hi = zs_cz_hi;  mig_nz = zs_nz;  mig_hz = zs_hz
+    part%n_mig = 0_int32
 
     do i = 1, part%n
 
@@ -617,6 +623,9 @@ contains
       part%pv(1,i_shift)  = xp_new
       part%pv(2,i_shift)  = yp_new
       part%pv(3,i_shift)  = zp_new
+      ! Same plane formula/clamp as zslab_iz_of_z (mod_zslab).
+      iz_mig = max(1_int32, min(mig_nz, int(zp_new / mig_hz, int32) + 1_int32))
+      if (iz_mig < mig_lo .or. iz_mig > mig_hi) call part%push_mig(i_shift)
       part%pv(4,i_shift) = vpx_new
       part%pv(5,i_shift) = vpy_new
       part%pv(6,i_shift) = vpz_new
@@ -630,6 +639,8 @@ contains
 
     part%n = part%n - np_lost
     if (part%n < 0_int32) part%n = 0_int32
+    part%mig_n_checked = part%n
+    part%mig_valid     = .true.
 
     ! Keep the invariant "slots past n have zeroed flags" by clearing only
     ! the np_lost slots compaction just vacated. This used to zero the
@@ -704,6 +715,9 @@ contains
     integer(int32) :: i, i_shift, i_see, ip_sec, n_sec
     integer(int32) :: ix, iy, iz
     integer(int32) :: flag_lost, np_lost
+    ! z-slab migration candidates (see ParticleSet%mig_idx)
+    integer(int32) :: iz_mig, mig_lo, mig_hi, mig_nz
+    real(real64)   :: mig_hz
     integer(int32) :: igrid, d_ind
 
     real(real64) :: qmdt
@@ -741,6 +755,8 @@ contains
     has_flag_cex  = allocated(part%flag_cex)
 
     np_lost = 0_int32
+    mig_lo = zs_cz_lo;  mig_hi = zs_cz_hi;  mig_nz = zs_nz;  mig_hz = zs_hz
+    part%n_mig = 0_int32
 
     do i = 1, part%n
 
@@ -975,6 +991,9 @@ contains
       part%pv(1,i_shift)  = xp_new
       part%pv(2,i_shift)  = yp_new
       part%pv(3,i_shift)  = zp_new
+      ! Same plane formula/clamp as zslab_iz_of_z (mod_zslab).
+      iz_mig = max(1_int32, min(mig_nz, int(zp_new / mig_hz, int32) + 1_int32))
+      if (iz_mig < mig_lo .or. iz_mig > mig_hi) call part%push_mig(i_shift)
       part%pv(4,i_shift) = vpx_new
       part%pv(5,i_shift) = vpy_new
       part%pv(6,i_shift) = vpz_new
@@ -988,6 +1007,8 @@ contains
 
     part%n = part%n - np_lost
     if (part%n < 0_int32) part%n = 0_int32
+    part%mig_n_checked = part%n
+    part%mig_valid     = .true.
 
     ! Keep the invariant "slots past n have zeroed flags" by clearing only
     ! the np_lost slots compaction just vacated. This used to zero the
@@ -1082,6 +1103,9 @@ contains
     integer(int32) :: ix, iy, iz
     integer(int32) :: ixB, iyB, izB
     integer(int32) :: flag_lost, np_lost
+    ! z-slab migration candidates (see ParticleSet%mig_idx)
+    integer(int32) :: iz_mig, mig_lo, mig_hi, mig_nz
+    real(real64)   :: mig_hz
     integer(int32) :: igrid, d_ind
 
     real(real64) :: qm2dt
@@ -1152,6 +1176,8 @@ contains
     end if
 
     np_lost = 0_int32
+    mig_lo = zs_cz_lo;  mig_hi = zs_cz_hi;  mig_nz = zs_nz;  mig_hz = zs_hz
+    part%n_mig = 0_int32
 
     do i = 1_int32, part%n
 
@@ -1570,6 +1596,9 @@ contains
       part%pv(1,i_shift)  = xp_new
       part%pv(2,i_shift)  = yp_new
       part%pv(3,i_shift)  = zp_new
+      ! Same plane formula/clamp as zslab_iz_of_z (mod_zslab).
+      iz_mig = max(1_int32, min(mig_nz, int(zp_new / mig_hz, int32) + 1_int32))
+      if (iz_mig < mig_lo .or. iz_mig > mig_hi) call part%push_mig(i_shift)
       part%pv(4,i_shift) = vpx_new
       part%pv(5,i_shift) = vpy_new
       part%pv(6,i_shift) = vpz_new
@@ -1583,6 +1612,8 @@ contains
 
     part%n = part%n - np_lost
     if (part%n < 0_int32) part%n = 0_int32
+    part%mig_n_checked = part%n
+    part%mig_valid     = .true.
 
     ! Keep the invariant "slots past n have zeroed flags" by clearing only
     ! the np_lost slots compaction just vacated. This used to zero the
@@ -1663,6 +1694,9 @@ contains
     integer(int32) :: ix, iy, iz
     integer(int32) :: ixB, iyB, izB
     integer(int32) :: flag_lost, np_lost
+    ! z-slab migration candidates (see ParticleSet%mig_idx)
+    integer(int32) :: iz_mig, mig_lo, mig_hi, mig_nz
+    real(real64)   :: mig_hz
     integer(int32) :: igrid, d_ind
 
     real(real64) :: qm2dt
@@ -1729,6 +1763,8 @@ contains
     end if
 
     np_lost = 0_int32
+    mig_lo = zs_cz_lo;  mig_hi = zs_cz_hi;  mig_nz = zs_nz;  mig_hz = zs_hz
+    part%n_mig = 0_int32
 
     do i = 1_int32, part%n
 
@@ -2086,6 +2122,9 @@ contains
       part%pv(1,i_shift)  = xp_new
       part%pv(2,i_shift)  = yp_new
       part%pv(3,i_shift)  = zp_new
+      ! Same plane formula/clamp as zslab_iz_of_z (mod_zslab).
+      iz_mig = max(1_int32, min(mig_nz, int(zp_new / mig_hz, int32) + 1_int32))
+      if (iz_mig < mig_lo .or. iz_mig > mig_hi) call part%push_mig(i_shift)
       part%pv(4,i_shift) = vpx_new
       part%pv(5,i_shift) = vpy_new
       part%pv(6,i_shift) = vpz_new
@@ -2099,6 +2138,8 @@ contains
 
     part%n = part%n - np_lost
     if (part%n < 0_int32) part%n = 0_int32
+    part%mig_n_checked = part%n
+    part%mig_valid     = .true.
 
     ! Keep the invariant "slots past n have zeroed flags" by clearing only
     ! the np_lost slots compaction just vacated. This used to zero the

@@ -78,6 +78,7 @@ module mod_collisionsGwenael
 
   use iso_fortran_env,          only: int32, int8, real64
   use mod_particles,            only: ParticleSet
+  use mod_zslab,                only: zs_c_lo, zs_c_hi, zs_cz_lo, zs_cz_hi
   use mod_RNG,                  only: ran2, load_gauss
   use omp_lib,                  only: omp_get_max_threads
   use mod_collisionDiagnostics, only: count_rxn, init_debug_diagnostics, record_np_mx, &
@@ -172,9 +173,10 @@ contains
     ! point 4 in "Faithfully reproduced legacy mechanics"), so the sum is
     ! call-invariant and only needs computing ONCE, as one vectorized pass
     ! per (species, thread) instead of a scalar loop re-run per trial.
-    ncells = int(n(1), int32) * int(n(2), int32) * int(n(3), int32)
-    allocate(total_cell_count(ncells, ntype_tracked))
-    allocate(first_proc(ncells, ntype_tracked))
+    ! This rank's z-slab of cells only (global ids, mod_zslab).
+    ncells = zs_c_hi - zs_c_lo + 1_int32
+    allocate(total_cell_count(zs_c_lo:zs_c_hi, ntype_tracked))
+    allocate(first_proc(zs_c_lo:zs_c_hi, ntype_tracked))
     call precompute_cell_target_info(part, ntype_tracked, nproc, ncells, &
                                       total_cell_count, first_proc)
 
@@ -346,8 +348,8 @@ contains
     ! Precomputed cross-thread cell-target lookup - see
     ! perform_collisions_gwenael's precompute_cell_target_info call.
     integer(int32), intent(in)    :: ncells
-    integer(int32), intent(in)    :: total_cell_count(ncells,ntype_tracked)
-    integer(int32), intent(in)    :: first_proc(ncells,ntype_tracked)
+    integer(int32), intent(in)    :: total_cell_count(zs_c_lo:zs_c_hi,ntype_tracked)
+    integer(int32), intent(in)    :: first_proc(zs_c_lo:zs_c_hi,ntype_tracked)
 
     integer(int32) :: ic, ip, icol, ind_col, n_re, ttype, c_ind
     integer(int32) :: npt_sig
@@ -811,8 +813,8 @@ contains
     ! no longer used in this body but kept in the signature to match the
     ! call site unchanged.
     integer(int32),    intent(in)    :: ncells
-    integer(int32),    intent(in)    :: total_cell_count(ncells)
-    integer(int32),    intent(in)    :: first_proc(ncells)
+    integer(int32),    intent(in)    :: total_cell_count(zs_c_lo:zs_c_hi)
+    integer(int32),    intent(in)    :: first_proc(zs_c_lo:zs_c_hi)
 
     integer(int32) :: ix, iy, iz, ici, ict, idir
     integer(int32) :: cnt_total, cnt_proc, target_proc
@@ -826,7 +828,9 @@ contains
     iz = int(zp/h(3), int32) + 1_int32
     ix = max(1_int32, min(n(1), ix))
     iy = max(1_int32, min(n(2), iy))
-    iz = max(1_int32, min(n(3), iz))
+    ! z clamped to this rank's slab: it holds every particle of its cells,
+    ! and only those (mod_zslab).
+    iz = max(zs_cz_lo, min(zs_cz_hi, iz))
 
     ici = (ix-1_int32) + n(1)*((iy-1_int32) + n(2)*(iz-1_int32)) + 1_int32
 
@@ -840,8 +844,8 @@ contains
         case (2_int32); if (ix >  1_int32) ict = ici - 1_int32
         case (3_int32); if (iy <  n(2)) ict = ici + n(1)
         case (4_int32); if (iy >  1_int32) ict = ici - n(1)
-        case (5_int32); if (iz <  n(3)) ict = ici + n(1)*n(2)
-        case (6_int32); if (iz >  1_int32) ict = ici - n(1)*n(2)
+        case (5_int32); if (iz <  zs_cz_hi) ict = ici + n(1)*n(2)
+        case (6_int32); if (iz >  zs_cz_lo) ict = ici - n(1)*n(2)
         end select
         cnt_total = total_cell_count(ict)
         if (cnt_total > 0_int32) exit
@@ -878,8 +882,8 @@ contains
     ! branchy, function-call-per-lookup ops the live version needed.
     type(ParticleSet), intent(in)  :: part(:,:)
     integer(int32),    intent(in)  :: ntype_tracked, nproc, ncells
-    integer(int32),    intent(out) :: total_cell_count(ncells,ntype_tracked)
-    integer(int32),    intent(out) :: first_proc(ncells,ntype_tracked)
+    integer(int32),    intent(out) :: total_cell_count(zs_c_lo:zs_c_hi,ntype_tracked)
+    integer(int32),    intent(out) :: first_proc(zs_c_lo:zs_c_hi,ntype_tracked)
 
     integer(int32) :: s, jproc, nblk, b, b0, b1, i0, i1
     integer(int32) :: clo(ntype_tracked,nproc), chi(ntype_tracked,nproc)
@@ -891,13 +895,14 @@ contains
     ! same sums, and first_proc is still the lowest jproc with a particle.
     do s = 1_int32, ntype_tracked
       do jproc = 1_int32, nproc
-        clo(s,jproc) = 1_int32
-        chi(s,jproc) = 0_int32
+        clo(s,jproc) = zs_c_lo
+        chi(s,jproc) = zs_c_lo - 1_int32
         if (.not. allocated(part(s,jproc)%pv)) cycle
         if (.not. allocated(part(s,jproc)%cell_count)) cycle
-        if (size(part(s,jproc)%cell_count) < ncells) cycle
-        clo(s,jproc) = max(1_int32, part(s,jproc)%cell_lo)
-        chi(s,jproc) = min(ncells, part(s,jproc)%cell_hi)
+        if (lbound(part(s,jproc)%cell_count,1) /= zs_c_lo .or. &
+            ubound(part(s,jproc)%cell_count,1) /= zs_c_hi) cycle
+        clo(s,jproc) = max(zs_c_lo, part(s,jproc)%cell_lo)
+        chi(s,jproc) = min(zs_c_hi, part(s,jproc)%cell_hi)
       end do
     end do
 
@@ -909,8 +914,8 @@ contains
     nblk = max(1_int32, min(ncells, 8_int32*int(omp_get_max_threads(), int32)))
     !$omp parallel do private(b,b0,b1,s,jproc,i0,i1) schedule(static)
     do b = 1_int32, nblk
-      b0 = int((int(ncells,8)*(b-1))/nblk, int32) + 1_int32
-      b1 = int((int(ncells,8)*b)/nblk, int32)
+      b0 = int((int(ncells,8)*(b-1))/nblk, int32) + zs_c_lo
+      b1 = int((int(ncells,8)*b)/nblk, int32) + zs_c_lo - 1_int32
       do s = 1_int32, ntype_tracked
         total_cell_count(b0:b1,s) = 0_int32
         first_proc(b0:b1,s)       = 0_int32

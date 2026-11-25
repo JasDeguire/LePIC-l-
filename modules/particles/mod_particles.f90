@@ -1,5 +1,6 @@
 module mod_particles
   use iso_fortran_env, only: real64, int32, int8
+  use mod_zslab,       only: zs_c_lo, zs_c_hi
   implicit none
   private
   public :: ParticleSet
@@ -37,10 +38,22 @@ module mod_particles
     integer(int8),  allocatable :: flag_dead(:)   ! size nmax
     integer(int32), allocatable :: flag_cex(:)    ! size nmax
 
+    ! z-slab migration (mod_particleMigration): the movers record here the
+    ! indices of the survivors that left this rank's z-slab, in increasing
+    ! order, and set mig_valid; mig_n_checked is part%n right after that
+    ! push (particles appended later, e.g. secondary electrons, are not in
+    ! the list). The migration then only visits these particles instead of
+    ! scanning the whole set, and clears mig_valid.
+    integer(int32), allocatable :: mig_idx(:)
+    integer(int32) :: n_mig = 0
+    integer(int32) :: mig_n_checked = 0
+    logical        :: mig_valid = .false.
+
   contains
     procedure :: allocate_pset
     procedure :: ensure_capacity
     procedure :: ensure_cell_storage
+    procedure :: push_mig
     procedure :: from_vxp
     procedure :: clear
     procedure :: destroy
@@ -136,11 +149,17 @@ contains
   end subroutine ensure_capacity
 
 
-  subroutine ensure_cell_storage(self, ncells_in)
+  subroutine ensure_cell_storage(self)
+    ! cell_count/cell_start cover only this MPI rank's z-slab of cells
+    ! (mod_zslab), allocated with their GLOBAL cell ids as bounds
+    ! (zs_c_lo:zs_c_hi) so callers keep indexing by global cell id.
     class(ParticleSet), intent(inout) :: self
-    integer(int32),     intent(in)    :: ncells_in
+    integer(int32) :: ncells_in
 
-    if (self%ncells == ncells_in) return
+    ncells_in = zs_c_hi - zs_c_lo + 1_int32
+    if (self%ncells == ncells_in .and. allocated(self%cell_count)) then
+      if (lbound(self%cell_count,1) == zs_c_lo) return
+    end if
 
     if (allocated(self%cell_count)) deallocate(self%cell_count)
     if (allocated(self%cell_start)) deallocate(self%cell_start)
@@ -149,13 +168,13 @@ contains
 
     if (self%ncells <= 0_int32) return
 
-    allocate(self%cell_count(self%ncells))
-    allocate(self%cell_start(self%ncells))
+    allocate(self%cell_count(zs_c_lo:zs_c_hi))
+    allocate(self%cell_start(zs_c_lo:zs_c_hi))
 
     self%cell_count = 0_int32
     self%cell_start = 0_int32
-    self%cell_lo = 1_int32
-    self%cell_hi = 0_int32
+    self%cell_lo = zs_c_lo
+    self%cell_hi = zs_c_lo - 1_int32
   end subroutine ensure_cell_storage
 
 
@@ -211,6 +230,25 @@ contains
   end subroutine clear
 
 
+  subroutine push_mig(self, i)
+    ! Append index i to the migration candidate list (rare: only called
+    ! for particles leaving the rank's slab).
+    class(ParticleSet), intent(inout) :: self
+    integer(int32),     intent(in)    :: i
+    integer(int32), allocatable :: tmp(:)
+
+    if (.not. allocated(self%mig_idx)) then
+      allocate(self%mig_idx(1024))
+    else if (self%n_mig >= size(self%mig_idx)) then
+      allocate(tmp(2*size(self%mig_idx)))
+      tmp(1:self%n_mig) = self%mig_idx(1:self%n_mig)
+      call move_alloc(tmp, self%mig_idx)
+    end if
+    self%n_mig = self%n_mig + 1_int32
+    self%mig_idx(self%n_mig) = i
+  end subroutine push_mig
+
+
   subroutine destroy(self)
     class(ParticleSet), intent(inout) :: self
 
@@ -224,6 +262,9 @@ contains
 
     if (allocated(self%flag_dead)) deallocate(self%flag_dead)
     if (allocated(self%flag_cex))  deallocate(self%flag_cex)
+    if (allocated(self%mig_idx))   deallocate(self%mig_idx)
+    self%n_mig = 0
+    self%mig_valid = .false.
 
     self%n      = 0_int32
     self%nmax   = 0_int32

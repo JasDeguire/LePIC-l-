@@ -2,6 +2,8 @@ module mod_simulation
   use iso_fortran_env, only: int32, real64, int8, int64
 
   use mod_state,                 only: State, advance_particles_local
+  use mod_particleMigration,     only: migrate_particles, mig_sent_total, mig_rounds_total, &
+                                       mig_calls_total
   use mod_density,               only: reduce_species_density, reduce_density_and_rho, &
                                        build_rho_from_np, average_species_density
   use mod_restart,               only: write_restart_modular
@@ -95,6 +97,8 @@ module mod_simulation
     ! legacy's flag_wrt (so a crash mid-write never destroys the only
     ! valid backup - the other directory still has the previous one).
     integer(int32) :: flag_wrt = 0_int32
+    ! mod_particleMigration's cumulative sent count at the previous print.
+    integer(int64) :: mig_sent_last = 0_int64
 
     ! Global electron stability quantities for Output/stability.dat,
     ! MPI-reduced in print_diagnostics(istep) and written by
@@ -286,9 +290,12 @@ contains
     self%t_dep_loop  = self%t_dep_loop
 
     ! Builds next step's rho here, right after the deposit (nothing else
-    ! writes rho or np in between), and MPI-sums only rho. fld%np is left
-    ! rank-local until a reader calls state%sync_np() - see
-    ! reduce_density_and_rho.
+    ! writes rho or np in between). rho is completed on this rank's
+    ! Poisson planes by exchanging single halo planes with the z-slab
+    ! neighbours (no global reduction). fld%np is left holding only this
+    ! rank's owned planes until a reader calls state%sync_np() - see
+    ! reduce_density_and_rho. If it was synced since the last reduction it
+    ! holds other ranks' planes, which must be cleared first.
     dt0 = MPI_Wtime()
     call reduce_density_and_rho( &
       n         = int(self%state%dom%n, int32), &
@@ -300,9 +307,8 @@ contains
       charge    = self%state%chem%charge(1:self%state%ntype), &
       np_red    = self%state%fld%np, &
       rho       = self%state%fld%rho, &
-      zlo       = self%state%np_zlo, &
-      zhi       = self%state%np_zhi, &
-      zend      = self%state%np_zend )
+      live      = self%state%np_live, &
+      np_red_dirty = self%state%np_synced )
     self%state%np_synced = .false.
     dt1 = MPI_Wtime()
     self%t_dep_reduce = self%t_dep_reduce + (dt1 - dt0)
@@ -417,6 +423,18 @@ contains
     real(real64) :: avg_factor, dr_cell, cell_volume, dt_interval
     real(real64), allocatable :: tmp_xy(:,:), tmp_xz(:,:), tmp_yz(:,:)
     real(real64), allocatable :: ang_xy(:,:), ang_xz(:,:), ang_yz(:,:)
+
+    ! z-slab decomposition: the reaction source/sink plane tallies are
+    ! per rank (each rank's own slab); sum them onto rank 0, which writes.
+    ! Collective, so before the non-root ranks return.
+    if (self%state%mpi_size > 1) then
+      call reduce_to_root(self%state%sour_avg_xy, self%state%comm)
+      call reduce_to_root(self%state%sour_avg_xz, self%state%comm)
+      call reduce_to_root(self%state%sour_avg_yz, self%state%comm)
+      call reduce_to_root(self%state%sink_avg_xy, self%state%comm)
+      call reduce_to_root(self%state%sink_avg_xz, self%state%comm)
+      call reduce_to_root(self%state%sink_avg_yz, self%state%comm)
+    end if
 
     if (self%state%mpi_rank /= 0) return
 
@@ -733,6 +751,23 @@ contains
   end subroutine output_step
 
 
+  subroutine reduce_to_root(a, comm)
+    ! In-place MPI sum of a plane tally onto rank 0. Non-root copies are
+    ! left unchanged; reset_2d_averages zeroes every rank's copy after the
+    ! output.
+    real(real64), intent(inout), contiguous :: a(:,:,:,:)
+    integer,      intent(in) :: comm
+    integer :: ierr, rank
+    real(real64) :: dummy(1)
+    call MPI_Comm_rank(comm, rank, ierr)
+    if (rank == 0) then
+      call MPI_Reduce(MPI_IN_PLACE, a, size(a), MPI_DOUBLE_PRECISION, MPI_SUM, 0, comm, ierr)
+    else
+      call MPI_Reduce(a, dummy, size(a), MPI_DOUBLE_PRECISION, MPI_SUM, 0, comm, ierr)
+    end if
+  end subroutine reduce_to_root
+
+
   subroutine print_debug_state(self, istep, label)
     class(Simulation), intent(in) :: self
     integer(int32), intent(in) :: istep
@@ -1010,7 +1045,8 @@ contains
           iz_pl        = self%state%params%iz_plot_plane, &
           ix_pl        = self%state%params%ix_plot_plane, &
           P_loss       = self%state%P_loss, &
-          mom_loss     = self%state%mom_loss )
+          mom_loss     = self%state%mom_loss, &
+          mpi_size     = self%state%mpi_size )
       end do
       !$omp end parallel do
       self%state%N_inj = 0_int32
@@ -1052,6 +1088,14 @@ contains
         N_flx        = self%state%N_flx, &
         mom_loss     = self%state%mom_loss )
       self%state%N_flx = 0_int32
+    end if
+
+    ! Injected particles may land anywhere in z: hand them to the ranks
+    ! owning their z-slab right away, so every rank holds only its own
+    ! particles at the end of each step (sorting, collisions and the next
+    ! deposit rely on it; backups then hold slab-local particles too).
+    if (self%state%cfg%flag_inj == 1_int32 .or. self%state%cfg%jne > 0.0_real64) then
+      call migrate_particles(self%state%part, global_mode=.true.)
     end if
 
     ! Output/write
@@ -1182,6 +1226,7 @@ contains
     integer :: ierr
     integer(int32) :: nspecies_print
     integer(int32), allocatable :: npart_global(:)
+    integer(int64) :: np_rank_loc, np_rank_min, np_rank_max, np_rank_sum, mig_loc, mig_sum
     ! self%state%P_loss/p_mac/part(:,:) hold only THIS MPI rank's local
     ! subdomain, so the sum(...)'s below (unchanged from before - they
     ! already summed across this rank's own OMP threads/iproc) are still
@@ -1291,6 +1336,21 @@ contains
       call MPI_Allreduce(MPI_IN_PLACE, p_mac_global, &
                           size(p_mac_global, kind=int32), &
                           MPI_DOUBLE_PRECISION, MPI_SUM, self%state%comm, ierr)
+    end if
+
+    ! z-slab decomposition: particle load balance across ranks and
+    ! migration traffic since the previous print (collective, all ranks).
+    if (self%state%mpi_size > 1_int32) then
+      np_rank_loc = 0_int64
+      do ptype = 1_int32, self%state%ntype
+        np_rank_loc = np_rank_loc + sum(int(self%state%part(ptype,:)%n, int64))
+      end do
+      mig_loc = mig_sent_total - self%mig_sent_last
+      self%mig_sent_last = mig_sent_total
+      call MPI_Reduce(np_rank_loc, np_rank_min, 1, MPI_INTEGER8, MPI_MIN, 0, self%state%comm, ierr)
+      call MPI_Reduce(np_rank_loc, np_rank_max, 1, MPI_INTEGER8, MPI_MAX, 0, self%state%comm, ierr)
+      call MPI_Reduce(np_rank_loc, np_rank_sum, 1, MPI_INTEGER8, MPI_SUM, 0, self%state%comm, ierr)
+      call MPI_Reduce(mig_loc,     mig_sum,     1, MPI_INTEGER8, MPI_SUM, 0, self%state%comm, ierr)
     end if
 
     ! --- stability.dat inputs (species 1 = electrons): max grid n_e, global
@@ -1406,6 +1466,13 @@ contains
         " npart ", self%state%chem%pname(ptype) , &
         " = ", npart_global(ptype)
     end do
+    if (self%state%mpi_size > 1_int32) then
+      write(*,'(a,i0,a,i0,a,i0,a,f6.3)') " npart per rank (z-slabs): min=", np_rank_min, &
+        " avg=", np_rank_sum/self%state%mpi_size, " max=", np_rank_max, &
+        " max/avg=", real(np_rank_max,real64) / max(1.0_real64, &
+                     real(np_rank_sum,real64)/real(self%state%mpi_size,real64))
+      write(*,'(a,i0)') " particles migrated between ranks since last print = ", mig_sum
+    end if
 
     write(*,'(a,i12,a)') " ===== MODULAR DIAGNOSTIC it = ", istep, " ====="
     write(*,'(a,3ES24.15)') " phi min/max/sum = ", &
@@ -1536,7 +1603,7 @@ contains
       write(*,'(a)') " ----- mover / deposit timing breakdown -----"
       write(*,'(a,f8.2,a,f8.2)') &
         "  mover_push(ms)=", 1000.0_real64*self%t_mover_push/real(self%t_count,real64), &
-        "  mover_bc(ms)=",   1000.0_real64*self%t_mover_bc/real(self%t_count,real64)
+        "  migrate(ms)=",   1000.0_real64*self%t_mover_bc/real(self%t_count,real64)
 
       ! TEMPORARY diagnostic - see move_and_bc_boris's header comment
       ! (mod_particleMover.f90). Only meaningful when the Boris pusher ran
